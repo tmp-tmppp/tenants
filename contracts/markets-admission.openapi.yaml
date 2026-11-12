@@ -1,0 +1,137 @@
+openapi: 3.1.0
+info:
+  title: Chance markets share-link admission (called by tenants)
+  version: 0.1.0
+  description: |
+    The internal endpoint of markets that tenants calls when a signed-in user presents a share link
+    (`POST /v1/share-joins` of tenants). This file is the agreed shape of that call: tenants keeps a fake of it in its
+    tests and checks every request it sends and every answer it accepts against this file; markets builds the real
+    endpoint with exactly these shapes.
+
+    - Not routed by the gateway. The caller is a service: a client-credentials access token of the client `tenants`
+      (audience `chance`), checked by markets like the other internal calls.
+    - The token of the share link is a secret: 32 random bytes in base64url (43 characters). It is sent only in the
+      body of this call, never in a path or a query, and it is never logged by either side. Markets compares its
+      SHA-256 with the stored hash in constant time.
+    - The call changes nothing in markets: it only decides what the link lets this caller do. It may be repeated.
+    - The answer reveals only what the link type allows. A token that is unknown, expired or revoked, and a market
+      that is closed for sharing, all answer the same `404`, so the endpoint is no oracle for guessing tokens.
+    - Tenants cannot see who is a member of which organization in markets, and markets cannot see memberships: so
+      markets decides by the link type and the caller's e-mail, and tenants adds the membership itself.
+servers:
+  - url: http://markets:8080
+    description: The service name in the cluster; markets may serve this path on a separate internal port.
+security:
+  - serviceToken: []
+
+paths:
+  /v1/internal/share-links/admission:
+    post:
+      operationId: admitShareLink
+      summary: What does this share link let this caller do?
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdmissionRequest'
+      responses:
+        '200':
+          description: The link exists and is valid; `decision` says what the caller may do
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdmissionResponse'
+        '400':
+          description: The request body is invalid
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '401':
+          description: The service token is missing or invalid
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '403':
+          description: The service token does not belong to a client that may call this endpoint
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No valid link has this token (unknown, expired, revoked or its market no longer shared)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+
+components:
+  securitySchemes:
+    serviceToken:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Client-credentials token of the client `tenants`, audience `chance`.
+  schemas:
+    AdmissionRequest:
+      type: object
+      additionalProperties: false
+      required: [token, userEmail, emailVerified]
+      properties:
+        token:
+          type: string
+          description: The share-link token as the sharer received it (32 random bytes, base64url, 43 characters)
+          pattern: '^[A-Za-z0-9_-]{43}$'
+        userEmail:
+          type: [string, 'null']
+          description: |
+            The e-mail address of the signed-in caller, as in the `email` claim of the caller's token; null when the
+            token has none. Used only for links of type `profiles`, and only when `emailVerified` is true.
+          maxLength: 320
+        emailVerified:
+          type: boolean
+          description: The `email_verified` claim of the caller's token; false when it is absent
+    AdmissionResponse:
+      type: object
+      additionalProperties: false
+      required: [decision, linkType, tenantId, marketId]
+      properties:
+        decision:
+          type: string
+          enum: [join, members_only, denied]
+          description: |
+            - `join`: the caller may become a trader of the market's organization (type `everyone`, or type
+              `profiles` with the caller's verified e-mail on the list).
+            - `members_only`: the link is for members of the organization (type `members`): tenants lets the caller
+              through only if the caller already is a member, and adds nobody.
+            - `denied`: the link is valid, but not for this caller (type `profiles`, e-mail not on the list or not
+              verified).
+        linkType:
+          type: string
+          enum: [members, profiles, everyone]
+        tenantId:
+          type: string
+          format: uuid
+          description: The organization (tenant) the market belongs to; its alias is the same text
+        marketId:
+          type: string
+          format: uuid
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string

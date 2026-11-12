@@ -1,0 +1,15 @@
+{{- if eq (int .Values.metrics.port) (int .Values.service.port) }}
+{{- fail "metrics.port must differ from service.port: the API port never serves /metrics" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "tenants.fullname" . }}
+  labels:
+    {{- include "tenants.labels" . | nindent 4 }}
+data:
+  PORT: {{ .Values.service.port | quote }}
+  METRICS_PORT: {{ .Values.metrics.port | quote }}
+  {{- range $key, $value := .Values.env }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}

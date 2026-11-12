@@ -1,0 +1,37 @@
+{{- if .Values.networkPolicy.enabled }}
+# Only the API gateway may reach the HTTP port (the smoke test Pod of this release is admitted as well), and only the
+# monitoring namespace may reach the metrics port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "tenants.fullname" . }}
+  labels:
+    {{- include "tenants.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "tenants.selectorLabels" . | nindent 6 }}
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayNamespaceLabels | nindent 14 }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.gatewayPodLabels | nindent 14 }}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/instance: {{ .Release.Name }}
+              app.kubernetes.io/component: smoke-test
+      ports:
+        - port: http
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.metrics.namespace | quote }}
+      ports:
+        - port: metrics
+          protocol: TCP
+{{- end }}

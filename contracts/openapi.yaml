@@ -1,0 +1,787 @@
+openapi: 3.1.0
+info:
+  title: Chance tenants API
+  version: 0.1.0
+  description: |
+    Tenant registry of Chance: organizations, invite codes, memberships and roles.
+
+    - Every endpoint except the health probes needs a bearer JWT issued by the identity provider.
+    - A user may belong to several organizations, one membership each, with its own role. A token names exactly
+      one organization (the web signs in with the scope `chance-organization:<alias>`) or none. The tenant of a
+      tenant-scoped call comes only from the token (claim `organization`), never from the request; a
+      tenant-scoped path whose `{id}` differs from the token's tenant answers `404`. `GET /v1/me/organizations`,
+      `POST /v1/invites/{code}/accept` and `POST /v1/share-joins` work with a token that has no organization (and
+      with one): they are how a user finds, and joins, the organizations to sign in to.
+    - The role in an organization is a group of that organization in the identity provider (`tenant-admin` or
+      `trader`); the service never gives tenant roles as realm roles.
+    - Errors are RFC 9457 `application/problem+json`.
+    - A token that is wrong is answered `401`. When the identity provider's signing keys cannot be fetched, the
+      token cannot be checked at all: every authenticated endpoint then answers `503` with `Retry-After` (code
+      `identity_provider_unavailable`), so a client retries instead of treating the token as rejected.
+    - The identity provider (Keycloak) is off the request path. A write stores its change, its event and an
+      identity-sync item in one transaction and answers; a background reconciler then makes the provider match the
+      database, so the token of a user carries a new tenant or role a moment later (`GET /v1/me` reports
+      `identityPending` until then).
+    - The gateway routes the prefixes `/v1/tenants`, `/v1/me`, `/v1/invites` and `/v1/share-joins`; the health
+      paths are not routed by the gateway.
+    - Joining through a share link asks markets (`contracts/markets-admission.openapi.yaml`, an internal call with a
+      service token) what the link lets the caller do; tenants adds the membership itself.
+servers:
+  - url: http://localhost:8080
+    description: Local run
+tags:
+  - name: Tenants
+    description: Platform administration of organizations
+  - name: Me
+    description: The caller's own memberships
+  - name: Members
+    description: Invites, share-link joins and members of one tenant
+  - name: Health
+    description: Kubernetes probes
+security:
+  - bearerAuth: []
+
+paths:
+  /v1/tenants:
+    post:
+      tags: [Tenants]
+      operationId: createTenant
+      summary: Create a tenant and its first admin invite
+      description: |
+        Platform admin only. Stores the tenant, a one-time `tenant-admin` invite, the event TenantCreated
+        and an identity-sync item in one transaction; the reconciler creates the organization in the
+        identity provider afterwards. The invite code is returned only here.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTenantRequest'
+      responses:
+        '201':
+          description: Tenant created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateTenantResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: The slug is already taken
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags: [Tenants]
+      operationId: listTenants
+      summary: List tenants
+      description: Platform admin only. Cursor pagination, oldest first.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of tenants
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TenantPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/me:
+    get:
+      tags: [Me]
+      operationId: getMe
+      summary: My tenant and role
+      description: |
+        Any valid token. `tenantId` and `role` come from the memberships table: the membership of the token's
+        organization; for a token without an organization, the user's only membership when there is exactly
+        one (so a client that has just joined its first organization learns that its token is stale), and null
+        when there are none or several (the client then chooses with `GET /v1/me/organizations`).
+        `tokenNeedsRefresh` is true when the token's tenant or role differs from that membership; the web UI then
+        signs in again. `identityPending` is true while the identity provider may not match the database yet
+        (the user's identity-sync item is queued): signing in again cannot help before it is false, so the web
+        UI waits and asks again instead of looping.
+      responses:
+        '200':
+          description: The caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/me/organizations:
+    get:
+      tags: [Me]
+      operationId: listMyOrganizations
+      summary: The organizations I belong to
+      description: |
+        Any valid token, with or without an organization: the list comes from the memberships table, so a user
+        who has just signed in without choosing an organization finds the ones to sign in to (scope
+        `chance-organization:<alias>`). Oldest membership first, cursor pagination (the page size is bounded by
+        `limit`, 100 at most, because the number of memberships of a user is not bounded). `identityPending` is true
+        while the identity provider may not yet hold every membership of the user: signing in to an organization
+        that was added a moment ago can fail until it is false.
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of the caller's organizations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrganizationPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/tenants/{id}/invites:
+    post:
+      tags: [Members]
+      operationId: createInvite
+      summary: Create an invite code for the tenant
+      description: Tenant admin of this tenant. The code is returned only in this response.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInviteRequest'
+      responses:
+        '201':
+          description: Invite created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invite'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/tenants/{id}/members:
+    get:
+      tags: [Members]
+      operationId: listMembers
+      summary: List the members of the tenant
+      description: Tenant admin of this tenant. Ids only; names are composed in the UI.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of members
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/tenants/{id}/members/{userId}/role:
+    put:
+      tags: [Members]
+      operationId: changeMemberRole
+      summary: Change the role of a member
+      description: |
+        Tenant admin of this tenant. Changes the role of the row and writes the event and an
+        identity-sync item in one transaction; the reconciler gives the user exactly this role in the
+        identity provider afterwards. Role changes of one tenant are applied one after the other, so an
+        unchanged role (also a repeated demotion) answers 200 without a new event. Demoting the last
+        `tenant-admin` answers 409.
+
+        A demotion, like a join, reaches the identity provider shortly after the request, not within it.
+        The user's current access token keeps the old role until it is refreshed (access tokens live
+        5 minutes), so a demoted user can still act with the old role for up to that long. A sync that
+        the identity provider rejects permanently is retried every 5 minutes and logged as an error.
+      parameters:
+        - $ref: '#/components/parameters/TenantId'
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangeRoleRequest'
+      responses:
+        '200':
+          description: The membership after the change
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Membership'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: The change would leave the tenant without a tenant admin
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/invites/{code}/accept:
+    post:
+      tags: [Members]
+      operationId: acceptInvite
+      summary: Join a tenant with an invite code
+      description: |
+        Any valid token, with or without an organization. Stores the membership, counts the use and writes the
+        event and an identity-sync item in one transaction; the reconciler adds the user to the organization and
+        puts the user in the group of the role afterwards, so a token for the organization can be had only after
+        that (see `identityPending` of `GET /v1/me`). A user who already belongs to other organizations joins one
+        more: one membership per organization, each with its own role. Accepting again as a member of the same
+        tenant answers 200 with the existing membership and counts no further use (the role of the invite does not
+        change an existing role). The tenant comes from the invite, not from the token.
+      parameters:
+        - name: code
+          in: path
+          required: true
+          description: The invite code as it was shown at creation
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+      responses:
+        '200':
+          description: The caller is a member of the tenant
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcceptInviteResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          description: The invite has expired or is used up
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/share-joins:
+    post:
+      tags: [Members]
+      operationId: joinByShareLink
+      summary: Join the organization of a shared market with a share link
+      description: |
+        Any valid token, with or without an organization. The share-link token comes in the body, never in a path or a
+        query (the share URL keeps it after `#`, which a browser never sends). Tenants asks markets what the link lets
+        the caller do (`contracts/markets-admission.openapi.yaml`: a service call with a timeout, a retry only on safe
+        failures and a circuit breaker) and then:
+
+        - link for everyone, or for chosen profiles with the caller's verified e-mail on the list: adds a `trader`
+          membership in the market's organization (`joined: true`), in one transaction with the event and an
+          identity-sync item, like an invite;
+        - the caller already is a member of that organization: `200` with the existing role and `joined: false`
+          (also for a link meant for members only); nothing is added and no event is written;
+        - link for members only and the caller is no member: `403` `share_link_members_only`;
+        - link for chosen profiles and the caller's e-mail is not listed or not verified: `403`
+          `share_link_not_permitted`;
+        - a token that is unknown, expired or revoked: `404` `share_link_not_found` (the same answer for all of them);
+        - markets cannot be reached or does not answer in time: `503` `market_service_unavailable` with
+          `Retry-After`; nothing was changed, the call can be repeated.
+
+        The answer names the organization (`alias`, the value of the sign-in scope) and the market, so the web can
+        sign in to that organization and open the market. The user's token carries the organization only after
+        signing in again, and only once `identityPending` of `GET /v1/me` is false. The call is idempotent, so it
+        needs no `Idempotency-Key`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShareJoinRequest'
+      responses:
+        '200':
+          description: The caller is a member of the market's organization
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareJoinResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: |
+            The link does not let this caller in: `share_link_members_only` (members only, caller is no member) or
+            `share_link_not_permitted` (chosen profiles, e-mail not listed or not verified)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No valid link has this token (`share_link_not_found`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /health/startup:
+    get:
+      tags: [Health]
+      operationId: healthStartup
+      summary: Startup probe
+      description: Answers once the service has applied its migrations and listens.
+      security: []
+      responses:
+        '200':
+          description: Started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: healthReady
+      summary: Readiness probe
+      description: |
+        Pings the service's own database only (always ready with in-memory stores). Answers 503 from the moment the
+        process gets SIGTERM until it exits, so the load balancer stops sending requests before the server closes.
+      security: []
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+        '503':
+          description: The database does not answer (`not_ready`), or the service is shutting down (`shutting_down`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: healthLive
+      summary: Liveness probe
+      description: Process only. It never touches the database.
+      security: []
+      responses:
+        '200':
+          description: Alive
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT from the identity provider, verified against its JWKS (issuer, audience and signature).
+        The token holds exactly one organization: the tenant is its alias in the `organization` claim, and the tenant
+        role (`tenant-admin` or `trader`) is the one group of that organization in `organization.<alias>.groups`
+        (`/tenant-admin` or `/trader`). `platform-admin` is a realm role in the realm roles claim; a `tenant-admin` or
+        `trader` realm role is ignored.
+
+  parameters:
+    TenantId:
+      name: id
+      in: path
+      required: true
+      description: Tenant id. It must equal the tenant of the token, otherwise the answer is 404.
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: Identity provider subject of the member; 1 to 255 characters, no control characters
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 255
+        pattern: '^[^\p{Cc}]+$'
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 20
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `nextCursor` of the previous page
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 512
+
+  responses:
+    BadRequest:
+      description: The request is invalid; `errors` names the fields
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: The bearer token is missing or invalid
+      headers:
+        WWW-Authenticate:
+          description: Bearer challenge
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: The token lacks the required role
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Not found (also the answer for another tenant's resources)
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: |
+        The signing keys of the identity provider cannot be fetched (it does not answer, answers with an error or
+        publishes a key set that cannot be read), so the token cannot be checked. The token is not necessarily wrong:
+        try again after the time in `Retry-After`. The code is `identity_provider_unavailable`. A token that is wrong
+        (expired, bad signature, wrong issuer or audience, unknown key id, malformed) is answered `401`.
+        `POST /v1/share-joins` also answers 503 (code `market_service_unavailable`) when markets cannot be asked.
+      headers:
+        Retry-After:
+          description: Seconds to wait before the request is repeated
+          schema:
+            type: integer
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Role:
+      type: string
+      enum: [trader, tenant-admin]
+    Problem:
+      type: object
+      description: RFC 9457 problem details
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          description: URI reference that identifies the problem type
+          examples: ['urn:chance:problem:slug-taken']
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          description: The request path
+        code:
+          type: string
+          description: Machine-readable problem code
+          examples: [slug_taken]
+        errors:
+          type: array
+          description: Invalid fields of a 400 answer
+          items:
+            type: object
+            required: [field, message]
+            properties:
+              field:
+                type: string
+              message:
+                type: string
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [up]
+    Tenant:
+      type: object
+      required: [id, name, slug, status, createdBy, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        slug:
+          type: string
+        status:
+          type: string
+          enum: [active, suspended]
+        createdBy:
+          type: string
+          description: Subject of the platform admin who created the tenant
+        createdAt:
+          type: string
+          format: date-time
+    CreateTenantRequest:
+      type: object
+      additionalProperties: false
+      required: [name, slug]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        slug:
+          type: string
+          description: Lowercase letters, digits and dashes, 3 to 40 characters, no leading or trailing dash
+          minLength: 3
+          maxLength: 40
+          pattern: '^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$'
+    Invite:
+      type: object
+      required: [code, role, maxUses, expiresAt]
+      properties:
+        code:
+          type: string
+          description: Shown only once; the service keeps its SHA-256 hash
+        role:
+          $ref: '#/components/schemas/Role'
+        maxUses:
+          type: integer
+          minimum: 1
+        expiresAt:
+          type: string
+          format: date-time
+    CreateTenantResponse:
+      type: object
+      required: [tenant, adminInvite]
+      properties:
+        tenant:
+          $ref: '#/components/schemas/Tenant'
+        adminInvite:
+          $ref: '#/components/schemas/Invite'
+    TenantPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tenant'
+        nextCursor:
+          type: [string, 'null']
+          description: Null on the last page
+    Me:
+      type: object
+      required: [userId, tenantId, role, tokenTenantId, tokenNeedsRefresh, identityPending]
+      properties:
+        userId:
+          type: string
+        tenantId:
+          type: [string, 'null']
+          format: uuid
+          description: Tenant from the memberships table
+        role:
+          oneOf:
+            - $ref: '#/components/schemas/Role'
+            - type: 'null'
+        tokenTenantId:
+          type: [string, 'null']
+          description: Tenant claim of the presented token
+        tokenNeedsRefresh:
+          type: boolean
+        identityPending:
+          type: boolean
+          description: |
+            True while the user's identity-sync item is queued, that is while the identity provider
+            may not yet hold the tenant and role of the database.
+    CreateInviteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+          default: trader
+        maxUses:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 1
+        expiresInHours:
+          type: integer
+          minimum: 1
+          maximum: 720
+          default: 168
+    Member:
+      type: object
+      required: [userId, role, joinedAt]
+      properties:
+        userId:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        joinedAt:
+          type: string
+          format: date-time
+    MemberPage:
+      type: object
+      required: [items, nextCursor]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        nextCursor:
+          type: [string, 'null']
+    ChangeRoleRequest:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role:
+          $ref: '#/components/schemas/Role'
+    Membership:
+      type: object
+      required: [tenantId, userId, role, joinedAt, updatedAt]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        userId:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        joinedAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    AcceptInviteResponse:
+      type: object
+      required: [tenantId, role]
+      properties:
+        tenantId:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/Role'
+    Organization:
+      type: object
+      required: [alias, tenantId, name, slug, role, joinedAt]
+      properties:
+        alias:
+          type: string
+          description: The alias of the organization in the identity provider, the value after `chance-organization:` in the sign-in scope. It equals `tenantId`.
+        tenantId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Display name of the organization
+        slug:
+          type: string
+        role:
+          $ref: '#/components/schemas/Role'
+        joinedAt:
+          type: string
+          format: date-time
+    OrganizationPage:
+      type: object
+      required: [items, nextCursor, identityPending]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Organization'
+        nextCursor:
+          type: [string, 'null']
+          description: Null on the last page
+        identityPending:
+          type: boolean
+          description: True while the user's identity-sync item is queued (see `GET /v1/me`)
+    ShareJoinRequest:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: The share-link token (the part of the share URL after `#`); 32 random bytes, base64url, 43 characters. It is never logged.
+          pattern: '^[A-Za-z0-9_-]{43}$'
+    ShareJoinResponse:
+      type: object
+      required: [alias, tenantId, name, marketId, role, joined]
+      properties:
+        alias:
+          type: string
+          description: The alias of the market's organization; sign in with the scope `chance-organization:<alias>`
+        tenantId:
+          type: string
+          format: uuid
+        name:
+          type: string
+          description: Display name of the organization
+        marketId:
+          type: string
+          format: uuid
+        role:
+          $ref: '#/components/schemas/Role'
+        joined:
+          type: boolean
+          description: True when this call added the membership, false when the caller already was a member

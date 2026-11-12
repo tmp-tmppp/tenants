@@ -1,0 +1,92 @@
+# Defaults, safe for a local cluster. values-dev.yaml and values-prod.yaml override them; the pipeline sets
+# image.repository, image.tag (sha-<commit>) and image.digest with --set-string and never puts secrets into
+# values.
+
+image:
+  repository: docker.io/example/tenants
+  tag: latest
+  # sha256:<64 hex>; when set, the image is pulled by digest (the tag stays for people).
+  digest: ""
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  port: 8080
+
+# Metrics (REQ-20): GET /metrics is served on a port of its own, never on service.port, so that the gateway can never
+# route it. The port is rendered as METRICS_PORT and as the container port "metrics"; the Pod annotations
+# prometheus.io/scrape, prometheus.io/port and prometheus.io/path tell Prometheus where to scrape. The Service does not
+# expose it.
+metrics:
+  port: 9464
+
+# Further Pod annotations (the prometheus.io ones come from metrics.port); the pipeline adds checksum/app-env so the Pods restart when the Secret changes.
+podAnnotations: {}
+
+# Secret settings (DATABASE_URL, KEYCLOAK_CLIENT_SECRET, MARKETS_ADMISSION_CLIENT_SECRET) come from this Secret as environment variables.
+# The pipeline creates it from the organization secret TENANTS_ENV; it is optional so the chart renders without it.
+existingSecret: tenants-env
+
+# Non-secret settings, rendered into a ConfigMap (all values are strings). Every key is described in README.md.
+env:
+  APP_ENV: production
+  LOG_LEVEL: info
+  NATS_URL: nats://nats:4222
+  KEYCLOAK_URL: http://identity:8080
+  KEYCLOAK_REALM: chance
+  KEYCLOAK_CLIENT_ID: tenants
+  # Markets answers the admission check of share links (POST /v1/internal/share-links/admission).
+  MARKETS_BASE_URL: http://markets:8080
+  MARKETS_ADMISSION_CLIENT_ID: tenants-markets
+  AUTH_JWKS_URL: http://identity:8080/realms/chance/protocol/openid-connect/certs
+  AUTH_ISSUER: http://localhost:8081/realms/chance
+  AUTH_AUDIENCE: chance
+  AUTH_ROLES_CLAIM: realm_access.roles
+  AUTH_TENANT_CLAIM: organization
+  DATABASE_POOL_MAX: "5"
+  OUTBOX_POLL_MS: "300"
+  # Max age of the TENANTS stream and how long the outbox keeps published rows; the same in every service, so a service
+  # started later still reads the older events (decision of 2026-11-11).
+  STREAM_MAX_AGE_DAYS: "30"
+  IDENTITY_SYNC_POLL_MS: "500"
+  # Drain after SIGTERM: readiness answers 503 and the Pod keeps serving for this long before it closes. It has to fit
+  # into terminationGracePeriodSeconds (30 in the Deployment) together with the 10 seconds a close may take.
+  SHUTDOWN_DELAY_MS: "5000"
+  INVITE_ADMIN_TTL_HOURS: "168"
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    memory: 256Mi
+
+probes:
+  startup:
+    path: /health/startup
+    periodSeconds: 2
+    failureThreshold: 30
+  readiness:
+    path: /health/ready
+    periodSeconds: 10
+    failureThreshold: 3
+  liveness:
+    path: /health/live
+    periodSeconds: 10
+    failureThreshold: 3
+
+# Admits only the API gateway to the HTTP port. Needs a network policy engine in the cluster (plan section 9).
+networkPolicy:
+  enabled: false
+  gatewayNamespaceLabels:
+    kubernetes.io/metadata.name: gateway
+  gatewayPodLabels:
+    app.kubernetes.io/name: traefik
+  # The namespace of Prometheus (selected by its kubernetes.io/metadata.name label): admitted on the metrics port only.
+  metrics:
+    namespace: monitoring
+
+# Smoke test run by "helm test" after every deploy: asks the readiness endpoint through the Service.
+smokeTest:
+  image: docker.io/library/busybox:1.38.0@sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4

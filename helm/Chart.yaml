@@ -1,0 +1,7 @@
+apiVersion: v2
+name: tenants
+description: Tenant registry of Chance (organizations, invite codes, memberships and roles).
+type: application
+# Chart version: bump on every change to the chart. The image tag is set by the pipeline (sha-<commit>).
+version: 0.2.0
+appVersion: "0.1.0"
